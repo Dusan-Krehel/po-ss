@@ -1,0 +1,23 @@
+$ ../po-ss dusan3838
+Actual time: 2021-03-29 20:17:32
+Get score for player 'dusan3838'.
+User have 494 games.                          
+Games: 494, Downloaded: 2, Cached: 492.                                      
+Table is created in file 'dusan3838.txt'.
+Graph is saved in file 'dusan3838.png'.
+Actual ELO: 1345
+
+#### ARITHMETIC ####
+Win (opp. ELO):  1302 (249 games)
+Draw (opp. ELO): 1343 (7 games)
+Lose (opp. ELO): 1349 (238 games)
+All games: 494
+Win: 50.40 %
+
+#### WEIGHT ####
+Win (opp. ELO):  1300 (249 games)
+Draw (opp. ELO): 1374 (7 games)
+Lose (opp. ELO): 1337 (244 games)
+Ignore: 1
+All games: 493
+Win: 50.40 %

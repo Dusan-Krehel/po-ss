@@ -1,0 +1,782 @@
+#!/usr/bin/php
+<?php
+/*
+
+po-ss 1.0.1 playok.com štatistika šachu (chess statistic)
+
+Create statistic of user based on ELO of opponnents & result of matches.
+
+--------------------------------------------------------------------------------
+
+MIT License
+
+Copyright (c) 2021 Dušan Kreheľ
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+--------------------------------------------------------------------------------
+
+Files: Export file in actual dir. Cache is save in '~/.cache/po-ss'
+       or 'cache'.
+
+- require:
+	- php-cli
+	- php-curl
+	- gnuplot (If You want graphs.)
+
+- run program:
+1) Download skript 'po-ss'.
+2) Set permision to run: chmod 755 po-ss
+3) Run program with user nick: ./po-ss dusan3838
+
+[Slovak]
+Program vyráta skore hráča na základe toho, proti akými protihráčmi
+hral, ale pri výpočte sa aktuálna hodnota hráča ignore. Rátaju sa
+iba priemery protihráčov. Priemerné ELO opp. je rátané zvlášť
+pre výhry, prehry a remizy.
+
+Ku reálnemu ELO hráča je najbližšie priemerné opp. ELO z váženého
+priemeru remíz.
+
+Zámer bolo nájsť presnejší ohodnotenie ELO hráča, nakoľko existujúca
+metóda výpočtu ELO hráča, tak sa ňou dá kus podvadať a nemusí odrážať
+reálne ELO hráča.
+[/Slovak]
+
+*/
+
+/****************************** FUNCTIONS ****************************/
+
+/* file are downloading per one soccet */
+global $curl_description;
+$curl_description=false;
+
+function download_init()
+{
+	global $curl_description;
+	
+	$curl_description=curl_init();
+}
+
+function download_url($url)
+{
+	global $curl_description;
+	
+	curl_setopt($curl_description, CURLOPT_USERAGENT, USER_AGENT);
+	curl_setopt($curl_description, CURLOPT_URL, $url);
+	curl_setopt($curl_description, CURLOPT_RETURNTRANSFER, true);
+	
+	$data=curl_exec($curl_description);
+	
+	return $data;
+}
+
+function download_quit()
+{
+	global $curl_description;
+	
+	if($curl_description !== false)
+	{
+		curl_close($curl_description);
+		$curl_description=false;
+	}
+}
+
+function get_game_setting($game_txt)
+{
+	$setting=array();
+	$lines=explode("\n", $game_txt);
+	foreach($lines as $line)
+	{
+		if(strncmp($line, "[", 1) != 0)
+			continue;
+		
+		$line=str_replace(array('[', ']','"'), '', $line);
+		$timeti=explode(' ', $line);
+		$setting[$timeti[0]]=$timeti[1];
+	}
+	
+	return $setting;
+}
+
+function get_game_side($setting, $name)
+{
+	if($setting['White'] === $name)
+		return 'White';
+	if($setting['Black'] === $name)
+		return 'Black';
+
+	return "?";
+}
+
+function get_elo($game_txt, $name)
+{
+	$setting=get_game_setting($game_txt);
+	if(count($setting) == 0)
+		return false;
+	
+	$side=get_game_side($setting, $name);
+	if($side === "?")
+		return false;
+	
+	if(!array_key_exists($side."Elo", $setting))
+		return false;
+
+	return $setting[$side."Elo"];
+}
+
+function get_links_of_games($html)
+{
+	$ret=array();
+	$ret_index=0;
+	
+	$html=str_replace("&amp;", "&", $html);
+	$html=str_replace("<a", "\n<a", $html);
+	$html=str_replace("</a>", "</a>\n", $html);
+	$lines=explode("\n", $html);
+	foreach($lines as $line)
+	{
+		if(strpos($line, ">txt</a>") === false)
+			continue;
+		
+		/* get url from <a> html line */
+		$line=str_replace('href=', '"href=', $line);
+		$timeti=explode('"', $line);
+		$count=count($timeti);
+		for($a=0; $a<$count;$a++)
+			if($timeti[$a] === "href=")
+			{
+				$ret[$ret_index++]="https://www.playok.com".$timeti[$a+1];
+				continue;
+			}
+	}
+	
+	return $ret;
+}
+
+function get_next_page($html)
+{	
+	$html=str_replace("&amp;", "&", $html);
+	$html=str_replace("<a", "\n<a", $html);
+	$html=str_replace("</a>", "</a>\n", $html);
+	$lines=explode("\n", $html);
+	foreach($lines as $line)
+	{
+		if(strpos($line, ">ďalšia strana") === false)
+			continue;
+		$line=str_replace('href=', '"href=', $line);
+		$timeti=explode('"', $line);
+		$count=count($timeti);
+		for($a=0; $a<$count;$a++)
+			if($timeti[$a] === "href=")
+				return "https://www.playok.com".$timeti[$a+1];
+	}
+	
+	return false;
+}
+
+function get_games($nick)
+{
+	$ret=array();
+	$games=0;
+	for($a=1;;$a++)
+	{
+		echo "\rReading list of games. It is actual $games games.";
+		flush();
+		$html=download_url("https://www.playok.com/sk/stat.phtml?u=$nick&g=ch&sk=2&page=$a");
+		$html=str_replace("\r\n", "\n", $html);
+		$links=get_links_of_games($html, $nick);
+		$games+=count($links);
+		$ret=array_merge($ret, $links);
+		
+		$next=get_next_page($html);
+		if($next === false)
+			break;
+		sleep(1);
+	}
+	
+	echo "\rUser have $games games.                          \n";
+	
+	return $ret;
+}
+
+function get_time($game_txt)
+{
+	$setting=get_game_setting($game_txt);
+	if(count($setting) == 0)
+		return false;
+	
+	$times=str_replace(".","-", $setting['Date'])." ".$setting['Time'];
+	$time=strtotime($times);
+	
+	return $time;
+}
+
+function how_wait($n, $count, $wait_us)
+{
+	$times_in_sec=$wait_us/1000000;
+	$count_actual=$count-$n;
+	$seconds=$count_actual*$times_in_sec;
+	$minuts=intval($seconds/60);
+	$secunds=$seconds-$minuts*60;
+	
+	$after_dot="";
+	if($minuts == 0 && $secunds <5)
+	{
+		$seconds_float_string=sprintf("%.1f", $seconds);
+		$after_dot=substr($seconds_float_string, strpos($seconds_float_string, "."));
+		if($after_dot == ".0")
+			$after_dot="";
+		$before_number="";
+	}
+	
+	return "~ ".sprintf("%02d:%02d%s", $minuts, $secunds, $after_dot);
+}
+
+/*for($a=0;$a<=4; $a++)
+	echo how_wait($a, 4, 500000)."\n";
+exit;*/
+
+function download_games($zoznam)
+{
+	asort($zoznam);
+	
+	$txt=array();
+	$txt_index=0;
+	$count=count($zoznam);
+	
+	$download=0;
+	$cache=0;
+	$progress_count=0;
+	
+	/* count all cache game - for timer */
+	$total_cached=0;
+	for($a=$count-1;$a>=0;$a--)
+	{
+		$sha_name=hash(TYPE_HASH, $zoznam[$a]);
+		if($sha_name === false)
+		{
+			file_put_contents("php://stderr", "ERROR create name of file from URL with ".TYPE_HASH.".\n");
+			exit(4);
+		}
+		
+		if(is_file(CACHE_DIR.$sha_name))
+			$total_cached++;
+	}
+	
+	for($a=$count-1;$a>=0;$a--)
+	{
+		$progress_count++;
+		$url=$zoznam[$a];
+		
+		$sha_name=hash(TYPE_HASH,$url);
+		if($sha_name === false)
+		{
+			file_put_contents("php://stderr", "ERROR create name of file from URL with ".TYPE_HASH.".\n");
+			exit(4);
+		}
+		
+		$have_cache=is_file(CACHE_DIR.$sha_name);
+				
+		if($have_cache)
+		{
+			$cache++;
+		}
+		else
+			$download++;
+		
+		if($have_cache)
+		{
+			echo " In front: $a. Downloaded $download. Cached $cache/$total_cached.   \r";
+			flush();
+			$game=file_get_contents(CACHE_DIR.$sha_name);
+			
+			$txt[$txt_index++]=$game;
+		}
+		else
+		{
+			echo " In front: $a. Downloaded $download. Cached $cache/$total_cached. End download: ".how_wait($download, $count-$total_cached, WAIT_ONE_DOWNLOAD)." s.   \r";
+			flush();
+		
+			$game=download_url($url);
+			$game=str_replace("\r\n", "\n", $game);
+			file_put_contents(CACHE_DIR.$sha_name, $game);
+			
+			$txt[$txt_index++]=$game;
+			usleep(WAIT_ONE_DOWNLOAD);
+		}
+	}
+	
+	echo "\rGames: $count, Downloaded: $download, Cached: $cache.                                      \n";
+	return $txt;
+}
+
+function get_actual_elo_chess($nick)
+{
+	$html=file_get_contents("https://www.playok.com/sk/stat.phtml?u=".$nick."&g=ch");
+	$html=str_replace("\r\n", "\n", $html);
+	$lines=explode("\n", $html);
+	foreach($lines as $line)
+		if(strpos($line, 'rating:') !== false)
+		{
+			$line=str_replace("<b>", "</b>", $line);
+			$timeti=explode("</b>", $line);
+			$elo=$timeti[1];
+			return $elo;
+		}
+	return false;
+}
+
+function player_statistic_win_lose_graph($array_games, $nick)
+{
+	$count_win=0;
+	$count_lose=0;
+	$count_draw=0;
+	$win=0;
+	$lose=0;
+	$draw=0;
+	$games=0;
+	$ignore=0;
+	
+	
+	
+	$elo_wins=array();
+	$elo_loses=array();
+	
+	foreach($array_games as $game)
+	{
+		$setting=get_game_setting($game);
+		
+		if(!isset($setting['WhiteElo']) && !isset($setting['BlackElo']))
+		{
+			$ignore++;
+			continue;
+		}		
+				
+		if($setting['White'] == $nick)
+			$elo_super=$setting['BlackElo'];
+		else
+			$elo_super=$setting['WhiteElo'];
+		
+		/* draw */
+		if($setting['Result'] == "1/2-1/2")
+		{
+			$draw+=$elo_super;
+			
+			$count_draw++;
+			
+			continue;
+		}
+		
+		$losel=true;
+		if($setting['Result'] == "1-0" && $setting['White'] == $nick)
+			$losel=false;
+		if($setting['Result'] == "0-1" && $setting['Black'] == $nick)
+			$losel=false;
+		
+		if($losel)
+		{
+			/* prehra */
+			$lose+=$elo_super;
+			
+			$count_lose++;
+			
+			array_push($elo_loses, $elo_super);
+		}
+		else
+		{
+			/* vyhra */
+			$win+=$elo_super;
+			$count_win++;
+			
+			array_push($elo_wins, $elo_super);
+		}
+	}
+	
+	file_put_contents($nick."_opp_wins.txt", implode("\n", $elo_wins));
+	file_put_contents($nick."_opp_loses.txt", implode("\n", $elo_loses));
+	
+	// missed code to create image
+}
+
+function player_statistic($array_games, $nick)
+{
+	$count_win=0;
+	$count_lose=0;
+	$count_draw=0;
+	$win=0;
+	$lose=0;
+	$draw=0;
+	$games=0;
+	$ignore=0;
+	
+	foreach($array_games as $game)
+	{
+		$setting=get_game_setting($game);
+		
+		if(!isset($setting['WhiteElo']) && !isset($setting['BlackElo']))
+		{
+			$ignore++;
+			continue;
+		}		
+				
+		if($setting['White'] == $nick)
+			$elo_super=$setting['BlackElo'];
+		else
+			$elo_super=$setting['WhiteElo'];
+		
+		/* draw */
+		if($setting['Result'] == "1/2-1/2")
+		{
+			$draw+=$elo_super;
+			
+			$count_draw++;
+			
+			continue;
+		}
+		
+		$losel=true;
+		if($setting['Result'] == "1-0" && $setting['White'] == $nick)
+			$losel=false;
+		if($setting['Result'] == "0-1" && $setting['Black'] == $nick)
+			$losel=false;
+		
+		if($losel)
+		{
+			/* prehra */
+			$lose+=$elo_super;
+			
+			$count_lose++;
+		}
+		else
+		{
+			/* vyhra */
+			$win+=$elo_super;
+			$count_win++;
+		}
+	}
+	
+	echo "\n#### ARITHMETIC ####\n";
+	echo "Win (opp. ELO):  ".sprintf("%d", ($count_win != 0 ? $win/$count_win:0))." ($count_win games)\n"; 
+	echo "Draw (opp. ELO): ".sprintf("%d", ($count_draw != 0 ? $draw/$count_draw:0))." ($count_draw games)\n"; 
+	echo "Lose (opp. ELO): ".sprintf("%d", ($count_lose != 0 ? $lose/$count_lose:0))." ($count_lose games)\n"; 
+	if($ignore != 0)
+		echo "Ignore: $ignore\n"; 
+	echo "All games: ".count($array_games)."\n"; 
+	echo "Win: ".sprintf("%.2f", $count_win/(count($array_games)/100))." %\n";
+}
+
+/* weight are: …, 1200 - 1299, 1300 - 1399, … */
+function player_statistic_weight($array_games, $nick)
+{
+	$count_win_weight=array(
+		"0" => 0,
+		"1" => 0,
+		"2" => 0,
+		"3" => 0,
+		"4" => 0,
+		"5" => 0,
+		"6" => 0,
+		"7" => 0,
+		"8" => 0,
+		"9" => 0,
+		"10" => 0,
+		"11" => 0,
+		"12" => 0,
+		"13" => 0,
+		"14" => 0,
+		"15" => 0,
+		"16" => 0,
+		"17" => 0,
+		"18" => 0,
+		"19" => 0,
+		"20" => 0,
+		"21" => 0,
+		"22" => 0,
+		"23" => 0,
+		"24" => 0,
+		"25" => 0,
+		"26" => 0,
+		"27" => 0,
+		"28" => 0,
+		"29" => 0
+	);
+	$score_draw_weight=$count_win_weight;
+	$count_lose_weight=$count_win_weight;
+	$count_win=0;
+	$count_lose=0;
+	$count_draw=0;
+	$win=0;
+	$lose=0;
+	$draw=0;
+	$games=0;
+	$ignore=0;
+
+	/* zistuje vahy */
+	foreach($array_games as $game)
+	{
+		$setting=get_game_setting($game);
+		//print_r($setting);
+		
+		if(!isset($setting['WhiteElo']) && !isset($setting['BlackElo']))
+		{
+			$ignore++;
+			continue;
+		}
+		
+		if($setting['White'] == $nick)
+			$elo_super=$setting['BlackElo'];
+		else
+			$elo_super=$setting['WhiteElo'];
+		
+		/* draw */
+		if($setting['Result'] == "1/2-1/2")
+		{
+			$draw+=$elo_super;
+			
+			$count_draw++;
+			
+			$score=$elo_super;
+			$score_draw_weight[$score/100]++;
+		}
+		
+		$is_losed_game=true;
+		if($setting['Result'] == "1-0" && $setting['White'] == $nick)
+			$is_losed_game=false;
+		if($setting['Result'] == "0-1" && $setting['Black'] == $nick)
+			$is_losed_game=false;
+		
+		if($is_losed_game)
+		{
+			/* lose */
+			$lose+=$elo_super;
+			
+			$count_lose++;
+			
+			$score=$elo_super;
+			$count_lose_weight[$score/100]++;
+		}
+		else
+		{
+			/* win */
+			$win+=$elo_super;
+			$count_win++;
+			
+			$score=$elo_super;
+			$count_win_weight[$score/100]++;
+		}
+	}
+
+	$cout_win=0;
+	$count_lose=0;
+	$count_draw=0;
+
+	$ccount_lose_w=0;
+	$count_win_w=0;
+	$count_draw_w=0;
+
+	$win=0;
+	$lose=0;
+	$draw=0;
+	$games=0;
+	$ignore=0;
+	
+	foreach($array_games as $game)
+	{
+		$setting=get_game_setting($game);
+		
+		if(!(isset($setting['WhiteElo']) && isset($setting['BlackElo'])))
+		{
+			$ignore++;
+			continue;
+		}
+		
+		if($setting['White'] == $nick)
+			$elo_super=$setting['BlackElo'];
+		else
+			$elo_super=$setting['WhiteElo'];
+		
+		$games++;
+		
+		/* draw */
+		if($setting['Result'] == "1/2-1/2")
+		{
+			$score=$elo_super;
+			$weight=$score_draw_weight[$score/100];
+			$draw=$draw+$elo_super*$weight;
+			$count_draw++;
+			$count_draw_w+=$weight;
+		}
+		
+		$is_losed_game=true;
+		if($setting['Result'] == "1-0" && $setting['White'] == $nick)
+			$is_losed_game=false;
+		if($setting['Result'] == "0-1" && $setting['Black'] == $nick)
+			$is_losed_game=false;
+		
+		if($is_losed_game)
+		{
+			$score=$elo_super;
+			$weight=$count_lose_weight[$score/100];
+			$lose=$lose+$elo_super*$weight;
+			
+			$count_lose++;
+			$ccount_lose_w+=$weight;
+		}
+		else
+		{
+			$score=$elo_super;
+			$weight=$count_win_weight[$score/100];
+			$win=$win+$elo_super*$weight;
+			$cout_win++;
+			$count_win_w+=$weight;
+		}
+	}
+
+	echo "\n#### WEIGHT ####\n";
+	echo "Win (opp. ELO):  ".sprintf("%d", ($win/$count_win_w))." ($cout_win games)\n"; 
+	echo "Draw (opp. ELO): ".sprintf("%d", ($draw/$count_draw_w))." ($count_draw games)\n"; 
+	echo "Lose (opp. ELO): ".sprintf("%d", ($lose/$ccount_lose_w))." ($count_lose games)\n"; 
+	if($ignore != 0)
+		echo "Ignore: $ignore\n"; 
+	echo "All games: $games\n";
+	echo "Win: ".sprintf("%.2f", $count_win/(count($array_games)/100))." %\n";
+}
+
+function score_user_history_chess($nick)
+{
+	echo "Actual time: ".date("Y-m-d H:i:s")."\n";
+	echo "Get score for player '$nick'.\n";
+	$games=get_games($nick);
+	
+	$downloaded=download_games($games);
+	$text="";
+	
+	echo "Create table.";
+	flush();
+	
+	/* save older elo */
+	$a=0;
+	foreach($downloaded as $game)
+	{
+		$a++;
+		$time=get_time($game);
+		$elo=get_elo($game, $nick);
+		if($time == false || $elo == false)
+			continue;
+		
+		$text.="$time\t$elo\n";
+	}
+	
+	/* save actual elo */
+	$actual_elo=get_actual_elo_chess($nick);
+	if($actual_elo !== false)
+		$text.=time()."\t".$actual_elo."\n";
+	
+	file_put_contents("$nick.txt", $text);
+	echo "\rTable is created in file '$nick.txt'.\n";
+	
+	if(is_file("/usr/bin/gnuplot"))
+	{
+		system("gnuplot -e 'set term png size ".PNG_WIDTH.",".PNG_HEIGHT."; set output \"$nick.png\"; set xdata time; set timefmt \"%s\";set format x \"%Y-%m-%d\";set grid;plot \"$nick.txt\" using 1:2 with linespoints title \"rating $nick on playok.com (last 6 mounts)\";'");
+		if(is_file("$nick.png"))
+			echo "Graph is saved in file '$nick.png'.\n";
+	}
+	
+	echo "Actual ELO: $actual_elo\n";
+	player_statistic($downloaded, $nick);
+	player_statistic_weight($downloaded, $nick);
+	//player_statistic_win_lose_graph($downloaded, $nick);
+}
+
+/**************************** "MAIN" ********************************/
+
+/* size of output image */
+define("PNG_WIDTH", 1600);
+define("PNG_HEIGHT", 900);
+
+define("WAIT_ONE_DOWNLOAD", 500000); // in µs
+
+/* user agent for HTTP client */
+define("USER_AGENT", "po-ss");
+
+if(!function_exists("curl_init"))
+{
+	file_put_contents("php://stderr", "ERROR: You need install php-curl.\n");
+	return 1;
+}
+
+$home=getenv("HOME");
+if($home !== false)
+{
+	if(!is_dir("$home/.cache"))
+		if(mkdir("$home/.cache") === false)
+		{
+			file_put_contents("php://stderr", "ERROR: Error create dir '$home/.cache'.\n");
+			return 2;
+		}
+	
+	if(!is_dir("$home/.cache/po-ss"))
+		if(mkdir("$home/.cache/po-ss") === false)
+		{
+			file_put_contents("php://stderr", "ERROR: Error create dir '$home/.cache/po-ss'.\n");
+			return 2;
+		}
+	
+	$cache_dir="$home/.cache/po-ss";
+}
+else
+{
+	if(!is_dir("cache_po-ss"))
+		if(mkdir("cache_po-ss") === false)
+		{
+			file_put_contents("php://stderr", "ERROR: Error create dir 'cache_po-ss'.\n");
+			return 2;
+		}	
+	
+	$cache_dir="cache_po-ss";
+	file_put_contents("php://stderr", "WARNING: Cache dir is set into dir 'cache'.\n");
+}
+
+$enable_hash=hash_algos();
+if(in_array("sha3-512", $enable_hash))
+	$type_hash="sha3-512";
+else
+	if(in_array("sha512", $enable_hash))
+		$type_hash="sha512";
+	else
+	{
+		file_put_contents("php://stderr", "ERROR: Your PHP doesn't support sha512 and sha3-512.\n");
+		exit(5);
+	}
+
+define('TYPE_HASH', $type_hash);
+define('CACHE_DIR', "$cache_dir/");
+
+if($argc !== 2)
+{
+	file_put_contents("php://stderr", "Usage: ${argv[0]} NICK_OF_USER\n");
+	return(3);
+}
+
+download_init();
+score_user_history_chess($argv[1]);
+download_quit();
+
+?>
